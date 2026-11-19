@@ -191,7 +191,7 @@ No HTTP middleware, cookie parsing, session creation or validation, IP reputatio
 
 - **Token Bucket over sliding window:** simple burst behavior and continuous replenishment; strict rolling-window quotas are intentionally not provided.
 - **Exact integer units over floating or fixed-point tokens:** no rounding drift and identical results in Go and Lua, at the cost of the precision bound in Section 4.
-- **Apply policy changes over rejecting them:** rollouts cannot cause request failures; the price is that misconfigured shared groups alternate policies instead of failing loudly.
+- **Apply policy changes over rejecting them:** rollouts cannot cause request failures; the price is that misconfigured shared groups alternate policies instead of failing loudly. This supersedes the policy-conflict error required by the original design baseline (commit `eb52680`), and was explicitly approved by the maintainer after V1 was implemented. The conflict error was rejected because a limit change or a rolling deploy with mixed old and new instances would turn every request on a live bucket into an error until that bucket refilled, which for long windows lasts hours. Encoding a policy fingerprint into the bucket key was also rejected: every rollout would reset limits to full burst, and mixed deploys would double the effective quota.
 - **Caller-supplied keys over transport adapters:** reusable in HTTP, TCP, UDP, jobs, and other contexts; callers own identity extraction and key normalization (for example IPv6 /64 aggregation).
 - **Atomic multi-rule API over independent calls:** prevents partial charging; requires one synchronization boundary per request.
 - **Separate Redis module:** Memory users carry no Redis dependency; the price is two modules to version.
