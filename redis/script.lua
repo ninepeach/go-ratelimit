@@ -3,6 +3,7 @@
 -- Returns {allowed, remaining, retry_us, ndenied, denied_index...}.
 -- All numbers stay below 2^53, so double arithmetic is exact; integer division
 -- is corrected for rounding and numbers are written with %.0f, not tostring.
+-- redis/differential_test.go checks this script against internal/bucket.
 
 local function idiv(a, b)
   local q = math.floor(a / b)
@@ -22,6 +23,19 @@ local function num(x)
   return string.format('%.0f', x)
 end
 
+-- Parses a stored field as an exact integer in [lo, 2^53 - 1], or returns nil.
+-- Stored state is untrusted (any client can write the key). Rejecting it here,
+-- before the commit phase, keeps every commit argument exact and in range and
+-- stops bad state from spreading: a zero window, for example, would otherwise
+-- store a NaN balance that no later call could repair.
+local function stored_int(x, lo)
+  local v = tonumber(x)
+  if v == nil or v ~= math.floor(v) or v < lo or v > 9007199254740991 then
+    return nil
+  end
+  return v
+end
+
 local t = redis.call('TIME')
 local now = tonumber(t[1]) * 1000000 + tonumber(t[2])
 local n = #KEYS
@@ -34,11 +48,15 @@ for i = 1, n do
   params[i] = {L, W, C}
   local v = redis.call('HMGET', KEYS[i], 'b', 'ts', 'w')
   local b, t0
-  if not v[1] then
+  if not v[1] and not v[2] and not v[3] then
     b, t0 = C, now
   else
-    b, t0 = tonumber(v[1]), tonumber(v[2])
-    local sw = tonumber(v[3])
+    local sw
+    b, t0, sw = stored_int(v[1], 0), stored_int(v[2], 0), stored_int(v[3], 1)
+    if not b or not t0 or not sw then
+      -- Nothing has been written yet. The message omits the key: keys may be personal data.
+      return redis.error_reply('ratelimit: corrupt bucket state')
+    end
     if sw ~= W then
       local tokens = idiv(b, sw)
       if tokens >= idiv(C, W) then b = C else b = tokens * W end
@@ -74,6 +92,14 @@ if #denied > 0 then
   return out
 end
 
+-- Commit phase. Every input is validated above, keys are distinct (Validate
+-- rejects duplicate rules) and each key is absent or a hash (HMGET succeeded),
+-- so these writes cannot fail on type or argument errors. Redis denies writes
+-- for server state (OOM, read-only replica, min-replicas, disk errors) only
+-- until a script's first write (scriptVerifyOOM and
+-- scriptVerifyWriteCommandAllow in Redis src/script.c), so such a failure can
+-- only occur before anything has been written. Redis cannot roll a script
+-- back, which is why the reads and checks above must complete first.
 for i = 1, n do
   local L, W, C = params[i][1], params[i][2], params[i][3]
   local nb = avail[i] - W

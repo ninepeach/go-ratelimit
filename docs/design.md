@@ -123,6 +123,8 @@ Concurrent calls never overspend a bucket or partially charge a multi-rule reque
 
 For Redis, cancellation after the script was sent leaves the outcome indeterminate: the script may or may not have committed. The error says so, and the backend never retries automatically.
 
+For Memory, the context is checked once before the mutex is acquired. A call that acquires the mutex completes its decision even if the context ends while it waits; the wait is short because no critical section blocks.
+
 ## 7. Memory Backend
 
 - One mutex guards all state; `Allow` holds it for O(rules + reclaimed buckets · log n).
@@ -141,6 +143,8 @@ For Redis, cancellation after the script was sent leaves the outcome indetermina
 - Lua converts numbers to strings with 14 significant digits, so the script writes state with `string.format('%.0f', x)` to keep values up to 2^53 exact.
 - One hash per bucket with fields `b`, `ts`, `w`. Key: `<prefix>:<len(group)>:<group><key>`; the length prefix makes the encoding unambiguous for arbitrary bytes. `prefix` is 1 to 64 bytes of `[A-Za-z0-9_.:-]`.
 - After a commit each key gets `PEXPIRE` of the time to refill to full, rounded up to milliseconds, plus one millisecond. Expiry therefore never resets a bucket before it would be full anyway. Like Memory reclamation, this uses the policy of the last accepted request: after a policy change, a bucket that was already full under the old policy starts full under the new one.
+- The script reads and checks every bucket before its first write, because Redis cannot roll a script back. Stored fields must be integers in range (`b >= 0`, `ts >= 0`, `w >= 1`, all at most 2^53 - 1); otherwise the call fails with `ErrBackend` before anything is written. With that check, the commit phase has no type or argument errors, and Redis rejects writes for server state (OOM, read-only replica, min-replicas, disk errors) only before a script's first write, so a call never commits some buckets and not others.
+- The Go side rejects any script reply that violates the `Result` contract (flag not 0 or 1, negative counts, inconsistent `RetryAfter` or `Denied`) with `ErrBackend`.
 - Failures are returned wrapped with `ErrBackend`; there is no fallback to Memory.
 - Redis Cluster is unsupported for multi-rule calls: a script's keys must share a hash slot, and forcing all buckets into one slot would create a hot shard. Single-rule calls would work on Cluster but are not a V1 guarantee.
 
@@ -179,7 +183,8 @@ Required cases:
 - policy changes (Limit, Burst, Window) apply without errors;
 - concurrent calls never overspend;
 - Memory reclamation, capacity exhaustion, and cancellation before commit;
-- Redis atomicity, TTL, backend errors, and cancellation.
+- Redis atomicity, TTL, backend errors, corrupt stored state, malformed replies, and cancellation;
+- a differential test of the Lua script against `internal/bucket` on random states, including window changes and values near 2^53.
 
 Redis integration tests use a real Redis instance (`REDIS_TEST_ADDR`) and are reported as skipped otherwise. Run `go test ./...`, `go test -race ./...`, and `go vet ./...` in both modules.
 

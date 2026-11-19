@@ -63,6 +63,11 @@ func (l *Limiter) Len() int {
 // Allow implements ratelimit.Limiter. It runs in O(len(rules)) under the
 // mutex plus amortized O(log n) reclamation, and allocates only for new
 // buckets and the Denied slice.
+//
+// ctx is checked once, before the mutex is acquired. Waiting for the mutex
+// cannot be interrupted, and a call that acquires it completes its decision
+// even if ctx ends meanwhile; the wait is bounded by other callers' critical
+// sections, which never block.
 func (l *Limiter) Allow(ctx context.Context, rules ...ratelimit.Rule) (ratelimit.Result, error) {
 	if err := ratelimit.Validate(rules); err != nil {
 		return ratelimit.Result{}, err

@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
+	"math"
 	"os"
 	"testing"
 	"time"
@@ -137,13 +138,26 @@ func TestBackendErrors(t *testing.T) {
 }
 
 func TestDecodeRejectsMalformedReplies(t *testing.T) {
-	for _, raw := range [][]int64{{}, {1, 0, 0}, {1, 0, 0, 1, 0}, {0, 0, 1, 0}, {0, 0, 1, 1, 5}, {0, 0, 1, 2, 0}} {
+	for _, raw := range [][]int64{
+		{}, {1, 0, 0}, {0, 0, 1, 2, 0}, // bad length
+		{2, 0, 0, 0}, {-1, 0, 1, 1, 0}, // allowed flag not 0 or 1
+		{1, -1, 0, 0},                 // negative remaining
+		{1, 0, 0, 1, 0}, {1, 0, 5, 0}, // allowed with denied rules or retry
+		{0, 0, 1, 0}, {0, 0, 0, 1, 0}, {0, 0, -1, 1, 0}, // denied without denied rules or retry
+		{0, 0, math.MaxInt64, 1, 0},       // retry overflows Duration
+		{0, 0, 1, 1, 5}, {0, 0, 1, 1, -1}, // denied index out of range
+		{0, 0, 1, 2, 1, 0}, {0, 0, 1, 2, 0, 0}, // denied indexes not strictly increasing
+	} {
 		if _, err := decode(raw, 2); !errors.Is(err, ratelimit.ErrBackend) {
 			t.Errorf("%v accepted", raw)
 		}
 	}
 	res, err := decode([]int64{0, 0, 1500, 2, 0, 1}, 2)
 	if err != nil || res.Allowed || res.RetryAfter != 1500*time.Microsecond || len(res.Denied) != 2 {
+		t.Fatalf("%+v %v", res, err)
+	}
+	res, err = decode([]int64{1, 3, 0, 0}, 2)
+	if err != nil || !res.Allowed || res.Remaining != 3 || res.RetryAfter != 0 || res.Denied != nil {
 		t.Fatalf("%+v %v", res, err)
 	}
 }
