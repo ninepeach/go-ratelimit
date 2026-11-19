@@ -1,7 +1,7 @@
 # go-ratelimit — V1 Design
 
-Status: implementation baseline (no implementation implied)
-Module: `github.com/ninepeach/go-ratelimit`
+Status: implementation baseline
+Modules: `github.com/ninepeach/go-ratelimit` (core + Memory), `github.com/ninepeach/go-ratelimit/redis` (Redis)
 
 ## 1. Problem and Constraints
 
@@ -13,18 +13,27 @@ Hard constraints:
 - Multiple rules in one request are checked and consumed atomically, or not consumed at all.
 - Backend failures are errors, not rate-limit denials; never silently fail open.
 - Core receives caller-provided keys and policies, not IP addresses, cookies, or sessions as special types.
+- Changing a policy must never turn into request-time errors. Deployments change limits; traffic must keep flowing.
 
-## 2. Public API Contract
+## 2. Modules and Dependencies
 
-Proposed minimal core types:
+- The root module contains the public types, validation, the Memory backend (`memory`), and the shared behavioral contract suite (`ratelimittest`). It has no third-party dependencies.
+- The Redis backend is a separate Go module (`redis/go.mod`) so that Memory-only users never compile or download a Redis client. It depends on `github.com/redis/go-redis/v9`.
+- Neither module depends on application frameworks. Framework adapters (for example `go-base/ratelimit`) live in their own repositories.
+
+## 3. Public API Contract
 
 ```go
 type Policy struct {
     Group  string
-    Limit  int64
-    Window time.Duration
-    Burst  int64
+    Limit  int64         // tokens replenished per Window
+    Window time.Duration // whole microseconds, >= 1ms
+    Burst  int64         // bucket capacity
 }
+
+func NewPolicy(group string, limit int64, window time.Duration, burst int64) (Policy, error)
+func (p Policy) Rule(key string) Rule
+func Validate(rules []Rule) error // used by backends; exported for third-party backends
 
 type Rule struct {
     Key    string
@@ -35,6 +44,7 @@ type Result struct {
     Allowed    bool
     Remaining  int64
     RetryAfter time.Duration
+    Denied     []int // indexes into the rules argument that lacked a token; nil when allowed
 }
 
 type Limiter interface {
@@ -42,140 +52,148 @@ type Limiter interface {
 }
 ```
 
-`Limit` is the number of tokens replenished per `Window`; `Burst` is bucket capacity. One accepted operation costs one token per distinct rule. A new bucket starts full.
+- `NewPolicy` validates once at startup so that misconfiguration fails before traffic. `Allow` validates again because `Policy` is a plain value; validation cost is O(rules) and allocation-free.
+- One accepted operation costs one token from every rule. A bucket that does not exist is full.
+- `Remaining` is the minimum whole-token count across all rules **after** deduction when allowed, or **without** deduction when denied.
+- `RetryAfter` is zero when allowed. When denied it is the maximum, over denied rules, of the time until that rule holds one whole token, assuming no other traffic. It is rounded up to the microsecond.
+- `Denied` lets callers tell which dimension (for example IP or account) triggered the denial, for audit and responses.
+- A denial is `(Result{Allowed:false}, nil)`. On error the Result is the zero value; callers check `err` first.
 
-`Remaining` is the minimum whole-token count across evaluated rules **after** an accepted operation, or the minimum whole-token count **without deduction** after a denial. `RetryAfter` is zero when allowed; when denied, it is the maximum wait until every currently insufficient rule has at least one token, assuming no intervening operations.
+Constructors:
 
-A successful result has `err == nil`, including ordinary denials. Errors return a zero-value result; callers must check `err` first.
-
-Constructors should be straightforward: `memory.New(...)` and `redis.New(client, ...)`. Do not add configuration options unless a concrete requirement exists. Redis client lifecycle remains owned by the caller.
-
-## 3. Policy and Bucket Identity
-
-Bucket identity is the ordered pair `(Group, Key)`, encoded without ambiguous string concatenation. Groups are independent namespaces, not a hierarchy.
-
-`Group` and `Key` must be non-empty. `Limit > 0`, `Window > 0`, and `Burst > 0`. Reject overflow-prone or otherwise unsupported values explicitly. Reject empty rule sets and duplicate bucket identities in one call.
-
-A live bucket must not silently change its policy. If the same identity is used with different `Limit`, `Window`, or `Burst`, return a policy-conflict error while that bucket exists. Once expired, a new policy can create a fresh bucket. Backend key identity must not incorporate policy fields in a way that bypasses this conflict check.
-
-## 4. Token Bucket Semantics
-
-Let capacity `B = Burst`, replenishment rate `r = Limit / Window`, last stored balance `t`, and elapsed time `dt >= 0`.
-
-Before evaluating a rule, calculate:
-
-```text
-available = min(B, t + r * dt)
+```go
+memory.New(maxBuckets int) (*memory.Limiter, error)
+redis.New(client *goredis.Client, prefix string) (*redis.Limiter, error)
 ```
 
-A rule passes when `available >= 1`. For an accepted request, store `available - 1`; for a denied multi-rule request, no rule loses a token. Internal timestamps and idle-expiry metadata may advance on a denied call only if this does not alter the observable rate-limit contract.
+Neither backend starts goroutines, so neither has `Close`. The Redis client is owned by the caller. Only `*goredis.Client` (single node, or Sentinel failover client) is accepted: Ring and Cluster clients cannot provide the atomicity contract, and accepting a generic interface would suggest they can.
 
-Use a representation that avoids cumulative floating-point drift, overflow, and inconsistent rounding between backends. Define and test the precision/rounding contract before implementation. Never allow negative balances or balances above `Burst`.
+## 4. Validation Limits
 
-This is an average-rate Token Bucket, **not** a strict sliding-window quota. For example, `Limit=60, Window=1m, Burst=10` means an average refill of one token per second with at most ten immediately available tokens.
+Every rule must satisfy, otherwise `Allow` returns `ErrInvalidRule` before touching any bucket:
 
-## 5. Atomic Multi-Rule Evaluation
+| Field | Constraint |
+| --- | --- |
+| rules per call | 1 to 16 |
+| `Group` | 1 to 64 bytes |
+| `Key` | 1 to 256 bytes (keys are often attacker-controlled; this bounds memory per bucket) |
+| `Limit`, `Burst` | >= 1 |
+| `Window` | >= 1ms and a whole number of microseconds |
+| precision | `Burst * WindowMicros + Limit <= 2^53 - 1` (see Section 5) |
+
+Two rules with the same `(Group, Key)` in one call return `ErrDuplicateRule`.
+
+The precision bound allows, for example, `Burst` up to 150,000,000 with a 1-minute window, 2,500,000 with 1 hour, and 104,000 with 24 hours.
+
+## 5. Token Bucket Semantics and Representation
+
+State per bucket: balance `b`, reference time `ts` (microseconds), and the window `w` (microseconds) the balance is expressed in.
+
+Units: one token is `W` balance units, where `W = Window` in microseconds. Refill adds `Limit` units per elapsed microsecond, so refill is exact integer arithmetic with no rounding and no drift. Capacity is `C = Burst * W`.
+
+Evaluation of one rule at decision time `now`:
+
+```text
+if bucket absent:            b = C, ts = now
+else if stored w != W:       b = floor(b / w) * W          // policy window changed: keep whole tokens
+b  = min(b, C)                                              // policy burst shrank
+dt = max(0, now - ts)
+dt = min(dt, ceil((C - b) / Limit))                         // never compute refill past full
+b  = min(C, b + Limit * dt)
+pass when b >= W
+```
+
+When every rule passes, each bucket stores `b - W` with `ts = max(ts, now)`. When any rule fails, nothing is written. All arithmetic stays below 2^53, which keeps it exact both in Go `int64` and in Redis Lua (whose numbers are IEEE doubles); integer division in Lua is done with an exactness correction step.
+
+**Policy changes are applied, not rejected.** A bucket keeps only `(b, ts, w)`; the policy comes from the call. A new `Limit` changes the refill rate immediately, a smaller `Burst` clamps the balance, a different `Window` converts the balance to whole tokens (fractional progress is dropped, which errs toward stricter limiting once). There is no policy-conflict error: such an error would make a configuration rollout fail every request for up to the refill time of every live bucket. Two call sites that share a `Group` with different policies will alternate policies; that is a caller configuration bug, prevented by defining each policy once.
+
+This is an average-rate Token Bucket, **not** a sliding-window quota. `Limit=60, Window=1m, Burst=10` refills one token per second with at most ten immediately available.
+
+## 6. Atomic Multi-Rule Evaluation
 
 `Allow(ctx, rules...)` is a single logical transaction:
 
-1. Validate all input rules and reject duplicate identities.
-2. Read the current state of every bucket.
-3. Calculate all replenished balances using one consistent decision time.
-4. If any balance is below one, deny without deducting from any bucket.
-5. Otherwise, deduct one token from every bucket and commit atomically.
+1. Validate all rules and reject duplicates.
+2. Return `ctx.Err()` if the context is already done.
+3. Read every bucket and compute balances with one decision time.
+4. If any rule lacks a whole token, deny without writing any bucket.
+5. Otherwise deduct one token from every bucket and commit atomically.
 
-Concurrent calls must never overspend a bucket or partially charge a multi-rule request. A context cancellation observed before commit must not cause a partial commit. Cancellation after an uncertain remote execution may produce an indeterminate outcome; do not claim the operation definitely did or did not consume tokens unless that is known. Document this Redis limitation and avoid automatic retries of ambiguous writes.
+Concurrent calls never overspend a bucket or partially charge a multi-rule request.
 
-## 6. Memory Backend
+For Redis, cancellation after the script was sent leaves the outcome indeterminate: the script may or may not have committed. The error says so, and the backend never retries automatically.
 
-- Thread-safe for concurrent `Allow` calls.
-- Prefer one mutex initially; optimize only when benchmarks justify it.
-- Use elapsed monotonic time when available.
-- Expire inactive buckets without creating a goroutine or timer per bucket.
-- Enforce a configurable maximum bucket count; capacity exhaustion is an explicit error.
-- Never silently evict active buckets in a way that resets effective limits.
-- Ensure a denied or invalid request does not partially consume tokens.
-- If a background cleanup worker is introduced, provide an explicit, idempotent shutdown contract; otherwise avoid a `Close` method solely for symmetry.
+## 7. Memory Backend
 
-Idle expiration must not reset a bucket earlier than the time required to refill to full capacity. Expiration and cleanup behavior must be tested.
+- One mutex guards all state; `Allow` holds it for O(rules + reclaimed buckets · log n).
+- Time is monotonic elapsed time since construction, in microseconds.
+- No goroutines or timers. A bucket is reclaimable once it has refilled to full, because a full bucket is indistinguishable from an absent one; reclaiming never changes observable behavior.
+- Reclamation uses the policy of the bucket's last accepted request, exactly like the Redis TTL, so both backends agree after policy changes.
+- Reclamation uses a min-heap ordered by the time each bucket becomes full. Every `Allow` pops buckets that are already full. Each bucket is pushed and popped at most once per lifetime, so reclamation is amortized O(log n) per bucket creation. No call ever scans the whole table.
+- `maxBuckets` is required. If an accepted request needs new buckets and the table is still full after reclamation, `Allow` returns `ErrCapacity` and changes nothing. Denied requests never create buckets. Active buckets are never evicted.
+- A key-flooding attacker can exhaust capacity; the explicit error lets the caller choose to fail closed or fall back. Size `maxBuckets` for the expected key cardinality within one refill period.
 
-## 7. Redis Backend
+## 8. Redis Backend
 
-- Accept an existing Redis client; do not manage its connection pool or credentials.
-- Use Redis server-side Lua to evaluate and commit all rules atomically.
-- Use Redis server time as the authoritative clock for Redis decisions.
-- Store sufficient state to validate policy conflicts and refill tokens.
-- Namespace keys using a configurable application prefix and collision-safe encoding.
-- Set TTLs so fully idle buckets are eventually reclaimed; TTL must not permit premature quota resets.
-- Report Redis failures as errors; do not fall back to Memory.
-- Never perform a multi-rule transaction as separate non-atomic Redis commands.
+- Requires Redis 6.2 or newer (scripts call `TIME`; effects replication is the default since 5.0). CI runs Redis 7; development used Redis 8.
+- One Lua script evaluates and commits all rules atomically, invoked with `EVALSHA` and an `EVAL` fallback. No multi-rule operation is ever split into separate commands.
+- Redis server time (`TIME`) is the only clock. Using `ts = max(ts, now)` keeps a clock step backwards (for example after failover) from crediting refill twice.
+- Lua converts numbers to strings with 14 significant digits, so the script writes state with `string.format('%.0f', x)` to keep values up to 2^53 exact.
+- One hash per bucket with fields `b`, `ts`, `w`. Key: `<prefix>:<len(group)>:<group><key>`; the length prefix makes the encoding unambiguous for arbitrary bytes. `prefix` is 1 to 64 bytes of `[A-Za-z0-9_.:-]`.
+- After a commit each key gets `PEXPIRE` of the time to refill to full, rounded up to milliseconds, plus one millisecond. Expiry therefore never resets a bucket before it would be full anyway. Like Memory reclamation, this uses the policy of the last accepted request: after a policy change, a bucket that was already full under the old policy starts full under the new one.
+- Failures are returned wrapped with `ErrBackend`; there is no fallback to Memory.
+- Redis Cluster is unsupported for multi-rule calls: a script's keys must share a hash slot, and forcing all buckets into one slot would create a hot shard. Single-rule calls would work on Cluster but are not a V1 guarantee.
 
-V1 targets a single Redis server or Sentinel-managed primary. Redis Cluster is **not guaranteed** for arbitrary multi-key atomic requests: Lua scripts require all involved keys to share a hash slot. Do not force all traffic into one hash slot without an explicit scalability decision. Document Cluster as unsupported for arbitrary multi-rule operations in V1.
+## 9. Error Model
 
-## 8. Error Model
+| Error | Meaning |
+| --- | --- |
+| `ErrInvalidRule` | empty call, too many rules, or a rule outside Section 4 limits |
+| `ErrDuplicateRule` | the same `(Group, Key)` twice in one call |
+| `ErrCapacity` | Memory table full after reclamation |
+| `ErrBackend` | Redis returned an error or the result could not be decoded |
+| `context.Canceled`, `context.DeadlineExceeded` | returned (wrapped) as-is; for Redis the commit may be indeterminate |
 
-Use idiomatic errors with `errors.Is` support where meaningful:
-- invalid rule or policy;
-- duplicate rule;
-- conflicting policy for an existing bucket;
-- Memory capacity exceeded;
-- backend failure;
-- context cancellation or deadline exceeded.
+All errors support `errors.Is`. Error strings never include keys, because keys may be personal data such as e-mail addresses or session identifiers.
 
-Rate-limit rejection is `Result{Allowed:false}` with a nil error. Do not expose credentials, raw session identifiers, or sensitive Redis connection data in error strings or logs.
+## 10. Observability and Costs
 
-## 9. Observability and Costs
+No logger, metrics registry, or background monitoring. Results carry enough detail (`Denied`, `RetryAfter`) for callers to instrument decisions.
 
-Do not add a mandatory logger, metrics registry, or background monitoring subsystem. Return actionable errors and documented results so callers can instrument decisions. Any optional instrumentation must have a demonstrated need and bounded overhead.
+| Operation | Cost |
+| --- | --- |
+| Memory `Allow` | O(rules) under one mutex, plus amortized O(log n) reclamation; allocates only for new buckets and `Denied` |
+| Redis `Allow` | one round trip; Lua work O(rules); blocks on the network |
 
-Document the cost of public operations. Memory is expected to scale with the number of supplied rules per call, subject to lock contention and cleanup; Redis requires a network round trip and a Lua operation whose work scales with the number of rules. These are design expectations, not measured performance claims. Benchmark before optimizing or publishing performance numbers.
+These are design expectations. Benchmark before optimizing or publishing numbers.
 
-## 10. Testing and Acceptance
+## 11. Testing and Acceptance
 
-Use a shared behavioral contract suite for both backends, plus backend-specific tests.
+A shared behavioral contract suite (`ratelimittest`) runs against both backends with a backend-supplied way to let time pass: Memory advances a controlled clock, Redis sleeps in real time and asserts with documented tolerances. Exact `Remaining` and `RetryAfter` values are asserted where the clock is controlled.
 
 Required cases:
-- validation, empty inputs, duplicate rules, policy conflict;
+- validation limits, empty input, duplicates;
 - full initial capacity, depletion, partial refill, full refill, Burst cap;
-- denied requests do not consume any rule, including mixed pass/fail multi-rule calls;
-- isolation by Group and Key;
-- `Remaining` and `RetryAfter` rounding and consistency;
+- denied multi-rule calls consume nothing and report `Denied` indexes;
+- isolation by Group and Key, including encodings that would collide under naive concatenation;
+- policy changes (Limit, Burst, Window) apply without errors;
 - concurrent calls never overspend;
-- Memory cleanup, capacity exhaustion, and cancellation;
-- Redis Lua atomicity, TTL, backend errors, and ambiguous cancellation behavior;
-- equivalent externally observable results under controlled clocks.
+- Memory reclamation, capacity exhaustion, and cancellation before commit;
+- Redis atomicity, TTL, backend errors, and cancellation.
 
-Redis integration tests must use a real Redis instance. Do not claim equivalence solely from mocks. Where clocks cannot be controlled identically, assert bounded, documented tolerances rather than exact timestamp equality.
+Redis integration tests use a real Redis instance (`REDIS_TEST_ADDR`) and are reported as skipped otherwise. Run `go test ./...`, `go test -race ./...`, and `go vet ./...` in both modules.
 
-Once implementation exists, run:
+## 12. Explicit Non-Goals
 
-```sh
-go test ./...
-go test -race ./...
-go vet ./...
-```
+No HTTP middleware, cookie parsing, session creation or validation, IP reputation, bot detection, geolocation, policy inheritance, additional algorithms, dashboard, distributed transactions, or Redis Cluster multi-key support.
 
-Report skipped Redis integration tests explicitly.
-
-## 11. Explicit Non-Goals
-
-No HTTP middleware, cookie parsing, session creation or validation, IP reputation, bot detection, geolocation, policy inheritance, additional rate algorithms, dashboard, or distributed transaction framework.
-
-## 12. Design Decisions and Trade-offs
+## 13. Design Decisions and Trade-offs
 
 - **Token Bucket over sliding window:** simple burst behavior and continuous replenishment; strict rolling-window quotas are intentionally not provided.
-- **Caller-supplied keys over transport adapters:** reusable in HTTP, TCP, UDP, jobs, and other contexts; callers own identity extraction and validation.
-- **Atomic multi-rule API over independent calls:** prevents partial charging; requires a single synchronization boundary per request.
-- **Memory + Redis over Memory-only V1:** supports both local and distributed deployment immediately, at the cost of maintaining backend parity.
-- **No arbitrary Redis Cluster atomicity:** avoids misleading guarantees and forced hot-slot designs.
-- **Small API over extensibility scaffolding:** additions require demonstrated use cases.
-
-## 13. Open Implementation Details
-
-Before writing core code, resolve these with the smallest correct choice and document it:
-- Exact fixed-point token representation and time precision shared across Memory and Redis.
-- Concrete constructors and minimal options for Memory capacity and Redis prefix.
-- Precise TTL calculation and policy-conflict lifetime.
-- Whether Redis Lua state is one key per bucket or a different encoding compatible with the atomicity contract.
-
-Do not silently replace the public API or semantics while resolving these details. Escalate changes that cross architectural decision boundaries defined by the global AI engineering rules.
+- **Exact integer units over floating or fixed-point tokens:** no rounding drift and identical results in Go and Lua, at the cost of the precision bound in Section 4.
+- **Apply policy changes over rejecting them:** rollouts cannot cause request failures; the price is that misconfigured shared groups alternate policies instead of failing loudly.
+- **Caller-supplied keys over transport adapters:** reusable in HTTP, TCP, UDP, jobs, and other contexts; callers own identity extraction and key normalization (for example IPv6 /64 aggregation).
+- **Atomic multi-rule API over independent calls:** prevents partial charging; requires one synchronization boundary per request.
+- **Separate Redis module:** Memory users carry no Redis dependency; the price is two modules to version.
+- **No Redis Cluster multi-key atomicity:** avoids misleading guarantees and forced hot-slot designs.
+- **Explicit capacity errors over eviction:** eviction of active buckets would let attackers reset other users' limits.
