@@ -48,4 +48,4 @@ cd redis && REDIS_TEST_ADDR=localhost:6379 go test -race ./...   # Redis integra
 
 Redis tests are skipped without `REDIS_TEST_ADDR`. Both backends run the shared contract suite in `ratelimittest`.
 
-The `redis` module builds against the checkout through a `replace` directive until the root module is tagged. To release: tag `vX.Y.Z`, change `redis/go.mod` to require that version and drop the `replace`, then tag `redis/vX.Y.Z`.
+The `redis` module requires a released version of the root module, so by default its tests build against that release, not the checkout. To change both modules together, use an uncommitted workspace (`go work init . ./redis`); CI sets `GOWORK=off` and always tests the released dependency. To release: tag `vX.Y.Z`, change `redis/go.mod` to require that version, then tag `redis/vX.Y.Z`.
